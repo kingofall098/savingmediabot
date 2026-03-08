@@ -21,7 +21,7 @@ db_pool = SimpleConnectionPool(
     20,  # maximum connections
     dsn=DATABASE_URL
 )
-ADMIN_ID = 8305774350  # Your Telegram ID
+ADMIN_ID = 7816588091  # Your Telegram ID
 user_sessions = {}
 user_timers = {}
 live_jobs = {}
@@ -1949,4 +1949,5 @@ if __name__ == "__main__":
     
     print("Bot is running...")
     bot.infinity_polling(skip_pending=True)
+
 
