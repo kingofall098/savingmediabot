@@ -492,6 +492,7 @@ def import_db_file(message):
                 item["file_size"],
                 item["media_group_id"],
                 item["duplicate_count"]
+                item["username"]
             ))
 
             inserted += 1
@@ -1939,4 +1940,5 @@ if __name__ == "__main__":
     
     print("Bot is running...")
     bot.infinity_polling(skip_pending=True)
+
 
