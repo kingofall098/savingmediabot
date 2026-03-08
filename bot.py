@@ -471,18 +471,22 @@ def import_db_file(message):
 
         try:
 
-            # ensure user exists
+            # insert user first
             cur.execute("""
-                INSERT INTO users (user_id)
-                VALUES (%s)
-                ON CONFLICT (user_id) DO NOTHING
-            """, (item["user_id"],))
+                INSERT INTO users (user_id, username)
+                VALUES (%s,%s)
+                ON CONFLICT (user_id)
+                DO UPDATE SET username = EXCLUDED.username
+            """, (
+                item["user_id"],
+                item["username"]
+            ))
 
             # insert media
             cur.execute("""
                 INSERT INTO stored_media
-                (user_id, username,file_id, file_type, caption, file_size, media_group_id, duplicate_count)
-                VALUES (%s.%s,%s,%s,%s,%s,%s,%s)
+                (user_id, file_id, file_type, caption, file_size, media_group_id, duplicate_count)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (user_id, file_id) DO NOTHING
             """, (
                 item["user_id"],
@@ -491,22 +495,24 @@ def import_db_file(message):
                 item["caption"],
                 item["file_size"],
                 item["media_group_id"],
-                item["duplicate_count"],
-                item["username"]
+                item["duplicate_count"]
             ))
 
             inserted += 1
 
+            # commit every 500 rows for safety
+            if inserted % 500 == 0:
+                conn.commit()
+
         except Exception as e:
             print("Import error:", e)
-            conn.rollback()   # reset failed transaction
+            conn.rollback()
 
     conn.commit()
     cur.close()
     release_connection(conn)
 
-    bot.reply_to(message, f"✅ Import completed\nImported: {inserted} media")
-@bot.message_handler(content_types=['photo','video','document','audio'])
+    bot.reply_to(message, f"✅ Import completed\nImported: {inserted} media")@bot.message_handler(content_types=['photo','video','document','audio'])
 def handle_media(message):
 
     save_user(message.from_user)
@@ -1943,4 +1949,3 @@ if __name__ == "__main__":
     
     print("Bot is running...")
     bot.infinity_polling(skip_pending=True)
-
