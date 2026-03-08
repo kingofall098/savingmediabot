@@ -12,7 +12,7 @@ from psycopg2.pool import SimpleConnectionPool
 from telebot.apihelper import ApiTelegramException
 # ================= CONFIG ================= #
 
-BOT_TOKEN = "8507190616:AAF4RtM6S-rzTzGvcbVxo6QsxZVNBEXu6s0"
+BOT_TOKEN = "7858154079:AAFfAPLPt9cXk3ztcSx1XmrDCn-57zVy9wM"
 # DATABASE_URL = "YOUR_POSTGRES_URL"
 DATABASE_URL = os.getenv("DATABASE_URL")
 # ================= DATABASE POOL ================= #
@@ -1928,4 +1928,5 @@ if __name__ == "__main__":
     bot.remove_webhook()
     
     print("Bot is running...")
+
     bot.infinity_polling(skip_pending=True)
