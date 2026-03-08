@@ -1928,4 +1928,5 @@ if __name__ == "__main__":
     bot.remove_webhook()
     
     print("Bot is running...")
+
     bot.infinity_polling(skip_pending=True)
