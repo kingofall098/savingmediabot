@@ -1,0 +1,1931 @@
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
+import psycopg2
+from datetime import datetime
+import os
+import threading
+import time
+from queue import Queue
+import random
+from psycopg2.pool import SimpleConnectionPool
+from telebot.apihelper import ApiTelegramException
+# ================= CONFIG ================= #
+
+BOT_TOKEN = "8507190616:AAF4RtM6S-rzTzGvcbVxo6QsxZVNBEXu6s0"
+# DATABASE_URL = "YOUR_POSTGRES_URL"
+DATABASE_URL = os.getenv("DATABASE_URL")
+# ================= DATABASE POOL ================= #
+db_pool = SimpleConnectionPool(
+    1,   # minimum connections
+    20,  # maximum connections
+    dsn=DATABASE_URL
+)
+ADMIN_ID = 8305774350  # Your Telegram ID
+user_sessions = {}
+user_timers = {}
+live_jobs = {}
+FILES_PER_PAGE = 5
+bot = telebot.TeleBot(BOT_TOKEN)
+session_lock = threading.Lock()
+admin_send_state = {}
+admin_active_jobs = {}
+
+
+job_queue = Queue()
+job_status_cache = {}
+job_status_lock = threading.Lock()
+worker_running = False
+# ================= DATABASE ================= #
+
+def get_connection():
+    return db_pool.getconn()
+
+def release_connection(conn):
+    db_pool.putconn(conn)
+    
+def init_db():
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS stored_media (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+            file_id TEXT NOT NULL,
+            file_type TEXT NOT NULL,
+            caption TEXT,
+            media_group_id TEXT,
+            saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, file_id),
+            file_size BIGINT DEFAULT 0
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS send_jobs (
+            id SERIAL PRIMARY KEY,
+            admin_id BIGINT,
+            target_user BIGINT,
+            group_id BIGINT,
+            last_sent_id BIGINT DEFAULT 0,
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    cur.execute("""
+        ALTER TABLE send_jobs
+        ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'running'
+    """)  
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_send_groups (
+            id SERIAL PRIMARY KEY,
+            target_user BIGINT,
+            group_id BIGINT,
+            group_title TEXT,
+            UNIQUE(target_user, group_id)
+        );
+    """) 
+    cur.execute("""
+        ALTER TABLE user_send_groups
+        ADD COLUMN IF NOT EXISTS group_title TEXT;
+    """)
+    cur.execute("""
+        ALTER TABLE stored_media
+        ADD COLUMN IF NOT EXISTS duplicate_count BIGINT DEFAULT 0
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_media ON stored_media(user_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_saved_at ON stored_media(saved_at);")
+
+    conn.commit()
+    cur.close()
+    release_connection(conn)
+    
+# ================= ADMIN PANEL Helper ================= #
+
+def admin_panel_text():
+    return "🛠 Admin Panel\n\nSelect an option:"
+
+def admin_panel_markup():
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("📊 Bot Stats", callback_data="admin_stats"))
+    markup.add(InlineKeyboardButton("👥 Total Users", callback_data="admin_users"))
+    markup.add(InlineKeyboardButton("📦 Total Files", callback_data="admin_files"))
+    markup.add(InlineKeyboardButton("👤 View Users", callback_data="admin_userlist_0"))
+    markup.add(InlineKeyboardButton("📤 Export Media DB", callback_data="admin_export_db"))
+    markup.add(InlineKeyboardButton("📥 Import Media DB", callback_data="admin_import_db"))
+    markup.add(InlineKeyboardButton("📊 Storage Analytics", callback_data="admin_analytics"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="menu_main"))
+    return markup
+USERS_PER_PAGE = 10
+
+def get_users_page(page):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    offset = page * USERS_PER_PAGE
+
+    cur.execute("""
+        SELECT user_id, username
+        FROM users
+        ORDER BY joined_at DESC
+        LIMIT %s OFFSET %s
+    """, (USERS_PER_PAGE, offset))
+
+    users = cur.fetchall()
+
+    cur.close()
+    release_connection(conn)
+
+    return users
+def validate_group(group_id):
+    try:
+        chat = bot.get_chat(group_id)
+
+        # Optional: check if bot is still member
+        member = bot.get_chat_member(group_id, bot.get_me().id)
+        if member.status in ["left", "kicked"]:
+            return False
+
+        return True
+
+    except Exception:
+        return False
+
+def clean_invalid_groups():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT group_id FROM user_send_groups")
+    groups = cur.fetchall()
+    cur.close()
+    release_connection(conn)
+
+    for (g_id,) in groups:
+        if not validate_group(g_id):
+            remove_group_from_db(g_id)
+            print("Removed invalid group:", g_id)
+def remove_group_from_db(group_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM user_send_groups
+        WHERE group_id = %s
+    """, (group_id,))
+    conn.commit()
+    cur.close()
+    release_connection(conn)
+def get_total_storage():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COALESCE(SUM(file_size), 0) FROM stored_media")
+    total_size = cur.fetchone()[0]
+    cur.close()
+    release_connection(conn)
+    return total_size
+# ================= DB HELPERS ================= #
+def get_storage_used(user_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COALESCE(SUM(file_size), 0) FROM stored_media WHERE user_id = %s",
+        (user_id,)
+    )
+    total_size = cur.fetchone()[0]
+    cur.close()
+    release_connection(conn)
+    return total_size
+def format_size(size):
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} TB"
+def save_user(user):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO users (user_id, username) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+        (user.id, user.username)
+    )
+    conn.commit()
+    cur.close()
+    release_connection(conn)
+
+def save_media(user_id, file_id, file_type, caption, file_size, media_group_id=None):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO stored_media
+        (user_id, file_id, file_type, caption, file_size, media_group_id)
+        VALUES (%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (user_id, file_id)
+        DO UPDATE SET duplicate_count = stored_media.duplicate_count + 1
+        RETURNING xmax = 0;
+    """, (user_id, file_id, file_type, caption, file_size, media_group_id))
+
+    result = cur.fetchone()
+    conn.commit()
+    cur.close()
+    release_connection(conn)
+
+    return result[0]  # True if inserted, False if duplicate
+def get_total_files(user_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM stored_media WHERE user_id = %s", (user_id,))
+    count = cur.fetchone()[0]
+    cur.close()
+    release_connection(conn)
+    return count
+
+def get_category_counts(user_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT file_type, COUNT(*)
+        FROM stored_media
+        WHERE user_id = %s
+        GROUP BY file_type
+    """, (user_id,))
+    rows = cur.fetchall()
+    cur.close()
+    release_connection(conn)
+    return dict(rows)
+
+# ================= DASHBOARD ================= #
+def get_total_duplicates():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COALESCE(SUM(duplicate_count),0) FROM stored_media")
+    total = cur.fetchone()[0]
+    cur.close()
+    release_connection(conn)
+    return total
+def get_user_duplicates(user_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COALESCE(SUM(duplicate_count),0)
+        FROM stored_media
+        WHERE user_id = %s
+    """, (user_id,))
+    total = cur.fetchone()[0]
+    cur.close()
+    release_connection(conn)
+    return total
+
+
+def dashboard_text(user_id):
+
+    total_files = get_total_files(user_id)
+    print("User total files:", total_files)
+    total_files = get_total_files(user_id)
+    total_size = format_size(get_storage_used(user_id))
+    if total_files == 0:
+        return "Welcome to Rock Cloud Vault!\n\n📦 Your storage is empty.\nStart by sending any media file to save it here."
+    else:
+        return f"Wellcome To Rock Cloud Vault\n\n📦 Your Storage:\n•📄 Total Files: {total_files}\n•💾 Total Size: {total_size}\n\nChoose an option:"
+
+def dashboard_markup(user_id):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("📁 My Files", callback_data="menu_files"))
+
+    if user_id == ADMIN_ID:
+        markup.add(InlineKeyboardButton("🛠 Admin Panel", callback_data="admin_panel"))
+
+    return markup
+
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    save_user(message.from_user)
+    bot.send_message(
+        message.chat.id,
+        dashboard_text(message.from_user.id),
+        reply_markup=dashboard_markup(message.from_user.id)
+    )
+@bot.message_handler(func=lambda m: m.from_user.id == ADMIN_ID and m.from_user.id in admin_send_state)
+def admin_group_input(message):
+    
+    if message.from_user.id in admin_send_state and "changing_job" in admin_send_state[message.from_user.id]:
+
+        job_id = admin_send_state[message.from_user.id]["changing_job"]
+
+        if message.forward_from_chat:
+            group_id = message.forward_from_chat.id
+            group_title = message.forward_from_chat.title
+        else:
+            group_id = int(message.text)
+            chat = bot.get_chat(group_id)
+            group_title = chat.title
+
+        # Update live job
+        live_jobs[job_id]["group_id"] = group_id
+        live_jobs[job_id]["group_title"] = group_title
+
+        # Update DB
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE send_jobs
+            SET group_id = %s
+            WHERE id = %s
+        """, (group_id, job_id))
+        conn.commit()
+        cur.close()
+        release_connection(conn)
+
+        bot.send_message(
+            message.chat.id,
+            f"✅ Group changed to: {group_title}\nPress Resume to continue."
+        )
+
+        del admin_send_state[message.from_user.id]["changing_job"]
+        return
+
+    if message.from_user.id not in admin_send_state:
+        return
+
+    state = admin_send_state[message.from_user.id]
+
+    # detect forwarded message
+    if message.forward_from_chat:
+
+        group_id = message.forward_from_chat.id
+        group_title = message.forward_from_chat.title
+        state["group_id"] = group_id
+
+    else:
+        # admin typed ID manually
+        try:
+            group_id = int(message.text)
+            state["group_id"] = group_id
+        except:
+            bot.reply_to(message, "❌ Invalid group ID")
+            return
+
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton(
+            "🚀 SEND ALL MEDIA NOW",
+            callback_data="admin_confirm_send"
+        )
+    )
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ Group saved: `{group_id}`\nPress button to send media",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+# ================= AUTO SAVE ================= #
+
+import threading
+import time
+
+media_groups = {}
+def finalize_user_upload(user_id, chat_id):
+    session = user_sessions.pop(user_id, None)
+    user_timers.pop(user_id, None)
+
+    if not session:
+        return
+
+    total_files = get_total_files(user_id)
+    total_size = format_size(get_storage_used(user_id))
+    message_id = session["message_id"]
+
+    if session["duplicate"] > 0:
+        text = (
+            f"⚔️ Upload Completed 🕷\n\n"
+            f"Total Sent: {session['total']}\n"
+            f"✅ Saved: {session['saved']}\n"
+            f"♻️ Skipped (Duplicates): {session['duplicate']}\n\n"
+            f"🗃️ Total Files: {total_files}\n"
+            f"🖼️ Total Photo Files: {session['photo']} \n"
+            f"🎬 Total Video Files: {session['video']} \n"
+            f"💾 Total Size: {total_size}"
+        )
+    else:
+        text = (
+            f"⚔️ Upload Completed 🕷\n\n"
+            f"Total Sent: {session['total']}\n"
+            f"✅ Saved: {session['saved']}\n\n"
+            f"🗃️ Total Files: {total_files}\n"
+            f"🎬 Total Video Files: {session['video']} \n"
+            f"🖼️ Total Photo Files: {session['photo']} \n"
+            f"💾 Total Size: {total_size}"
+        )
+
+    bot.edit_message_text(
+        text,
+        chat_id,
+        message_id
+    )
+
+album_buffer = {}
+album_timers = {}
+def reset_user_timer(user_id, chat_id):
+
+    if user_id in user_timers:
+        user_timers[user_id].cancel()
+
+    t = threading.Timer(
+        5.0,
+        finalize_user_upload,
+        args=(user_id, chat_id)
+    )
+
+    user_timers[user_id] = t
+    t.start()
+@bot.message_handler(content_types=['document'])
+def import_db_file(message):
+
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    if not message.document.file_name.endswith(".json"):
+        return
+
+    import json
+
+    file_info = bot.get_file(message.document.file_id)
+    file_data = bot.download_file(file_info.file_path)
+
+    data = json.loads(file_data.decode("utf-8"))
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    inserted = 0
+
+    for item in data:
+
+        try:
+            cur.execute("""
+                INSERT INTO stored_media
+                (user_id, file_id, file_type, caption, file_size, media_group_id, duplicate_count)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (user_id, file_id) DO NOTHING
+            """, (
+                item["user_id"],
+                item["file_id"],
+                item["file_type"],
+                item["caption"],
+                item["file_size"],
+                item["media_group_id"],
+                item["duplicate_count"]
+            ))
+
+            inserted += 1
+
+        except Exception as e:
+            print("Import error:", e)
+
+    conn.commit()
+    cur.close()
+    release_connection(conn)
+
+    bot.reply_to(message, f"✅ Import completed\nImported: {inserted} media")
+@bot.message_handler(content_types=['photo','video','document','audio'])
+def handle_media(message):
+
+    save_user(message.from_user)
+
+    media_group_id = message.media_group_id
+    
+
+    # ---------- detect file ----------
+    if message.content_type == "photo":
+        file_id = message.photo[-1].file_id
+        file_size = message.photo[-1].file_size
+        file_type = "photo"
+
+    elif message.content_type == "video":
+        file_id = message.video.file_id
+        file_size = message.video.file_size
+        file_type = "video"
+
+    elif message.content_type == "document":
+        file_id = message.document.file_id
+        file_size = message.document.file_size
+        file_type = "document"
+
+    elif message.content_type == "audio":
+        file_id = message.audio.file_id
+        file_size = message.audio.file_size
+        file_type = "audio"
+
+    else:
+        return
+
+    caption = message.caption
+    user_id = message.from_user.id
+
+    # =========================
+    # ALBUM DETECTED
+    # =========================
+    if media_group_id:
+
+        if media_group_id not in album_buffer:
+            album_buffer[media_group_id] = []
+
+        album_buffer[media_group_id].append(
+            (message.chat.id, user_id, file_id, file_type, caption, file_size, media_group_id)
+        )
+
+        # Cancel old timer
+        if media_group_id in album_timers:
+            album_timers[media_group_id].cancel()
+
+        # SAFE finalize function
+        def finalize_album(mgid):
+            items = album_buffer.pop(mgid, [])
+            if not items:
+                return
+
+            chat_id = items[0][0]
+            user_id = items[0][1]
+
+            with session_lock:
+                if user_id not in user_sessions:
+                    msg = bot.send_message(chat_id, "📥 Saving files...")
+                    user_sessions[user_id] = {
+                        "total": 0,
+                        "saved": 0,
+                        "duplicate": 0,
+                        "photo": 0,
+                        "video": 0,
+                        "document": 0,
+                        "audio": 0,
+                        "message_id": msg.message_id
+                    }
+
+            for _, u_id, file_id, file_type, caption, file_size, mgid in items:
+                result = save_media(u_id, file_id, file_type, caption, file_size, mgid)
+
+                if result:
+                    user_sessions[user_id]["saved"] += 1
+                    user_sessions[user_id][file_type] += 1
+                else:
+                    user_sessions[user_id]["duplicate"] += 1
+
+            user_sessions[user_id]["total"] += len(items)
+
+            reset_user_timer(user_id, message.chat.id)
+        # Start timer properly with argument
+        t = threading.Timer(3.0, finalize_album, args=(media_group_id,))
+        album_timers[media_group_id] = t
+        t.start()
+    else:
+        # single media
+        chat_id = message.chat.id
+        
+        is_saved = save_media(user_id, file_id, file_type, caption, file_size, None)
+
+        with session_lock:
+            if user_id not in user_sessions:
+                msg = bot.send_message(chat_id, "📥 Saving files...")
+                user_sessions[user_id] = {
+                    "total": 0,
+                    "saved": 0,
+                    "duplicate": 0,
+                    "photo": 0,
+                    "video": 0,
+                    "document": 0,
+                    "audio": 0,
+                    "message_id": msg.message_id
+                }
+            user_sessions[user_id]["total"] += 1
+
+            if is_saved:
+                user_sessions[user_id]["saved"] += 1
+                user_sessions[user_id][file_type] += 1
+            else:
+                user_sessions[user_id]["duplicate"] += 1
+
+            # reset timer
+            if user_id in user_timers:
+                user_timers[user_id].cancel()
+            # Start new timer to finalize also there is timer for album, too
+            t = threading.Timer(
+                5.0,
+                finalize_user_upload,
+                args=(user_id, message.chat.id)
+            )
+            user_timers[user_id] = t
+            t.start()
+
+        
+# ================= CATEGORY MENU ================= #
+
+def category_menu(user_id):
+    counts = get_category_counts(user_id)
+
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton(f"📷 Photos ({counts.get('photo',0)})", callback_data="cat_photo_0"))
+    markup.add(InlineKeyboardButton(f"🎥 Videos ({counts.get('video',0)})", callback_data="cat_video_0"))
+    markup.add(InlineKeyboardButton(f"📄 Documents ({counts.get('document',0)})", callback_data="cat_document_0"))
+    markup.add(InlineKeyboardButton(f"🎵 Audio ({counts.get('audio',0)})", callback_data="cat_audio_0"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="menu_main"))
+    return markup
+
+# ================= CATEGORY PAGE ================= #
+
+def category_page(user_id, file_type, page):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    offset = page * FILES_PER_PAGE
+
+    cur.execute("""
+        SELECT id, file_id, saved_at
+        FROM stored_media
+        WHERE user_id = %s AND file_type = %s
+        ORDER BY id DESC
+        LIMIT %s OFFSET %s
+    """, (user_id, file_type, FILES_PER_PAGE, offset))
+
+    rows = cur.fetchall()
+    cur.close()
+    release_connection(conn)
+
+    markup = InlineKeyboardMarkup()
+
+    for media_id, file_id, saved_at in rows:
+        date_str = saved_at.strftime("%d %b %H:%M")
+        markup.add(
+            InlineKeyboardButton(
+                f"{date_str}",
+                callback_data=f"get_{file_type}_{media_id}"
+            )
+        )
+
+    if page > 0:
+        markup.add(InlineKeyboardButton("⬅ Prev", callback_data=f"cat_{file_type}_{page-1}"))
+
+    if len(rows) == FILES_PER_PAGE:
+        markup.add(InlineKeyboardButton("Next ➡", callback_data=f"cat_{file_type}_{page+1}"))
+
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="menu_files"))
+
+    text = f"{file_type.upper()}\nPage: {page+1}"
+    return text, markup
+
+# ================= CALLBACKS ================= #
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    data = call.data
+    
+    if data == "menu_main":
+        bot.edit_message_text(
+            dashboard_text(call.from_user.id),
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=dashboard_markup(call.from_user.id)
+        )
+    elif data == "admin_panel":
+        if call.from_user.id != ADMIN_ID:
+            bot.answer_callback_query(call.id, "Unauthorized")
+            return
+        bot.edit_message_text(
+            admin_panel_text(),
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=admin_panel_markup()
+        )
+    elif data == "admin_stats":
+        if call.from_user.id != ADMIN_ID:
+            bot.answer_callback_query(call.id, "Unauthorized")
+            return
+        conn  = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users")
+        total_users = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM stored_media")
+        total_files = cur.fetchone()[0]
+        cur.close()
+        release_connection(conn)
+        total_size = format_size(get_total_storage())
+        bot.edit_message_text(
+            f"📊 Bot Statistics\n\n"
+            f"👥 Total Users: {total_users}\n"
+            f"📦 Total Files: {total_files}\n"
+            f"💾 Total Storage Used: {total_size}",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=admin_panel_markup()
+        )
+    elif data == "admin_export_db":
+
+        if call.from_user.id != ADMIN_ID:
+            bot.answer_callback_query(call.id, "Unauthorized")
+            return
+
+        conn = get_connection()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT user_id, file_id, file_type, caption, file_size, media_group_id, duplicate_count
+            FROM stored_media
+            ORDER BY id ASC
+        """)
+
+        rows = cur.fetchall()
+
+        cur.close()
+        release_connection(conn)
+
+        import json
+        import tempfile
+
+        data = []
+
+        for r in rows:
+            data.append({
+                "user_id": r[0],
+                "file_id": r[1],
+                "file_type": r[2],
+                "caption": r[3],
+                "file_size": r[4],
+                "media_group_id": r[5],
+                "duplicate_count": r[6]
+            })
+
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+
+        with open(temp_file.name, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+        bot.send_document(call.message.chat.id, open(temp_file.name, "rb"))
+
+        bot.answer_callback_query(call.id, f"✅ Export completed.\nTotal media exported: {len(data)}")
+    elif data == "admin_import_db":
+
+        if call.from_user.id != ADMIN_ID:
+            bot.answer_callback_query(call.id, "Unauthorized")
+            return
+
+        bot.send_message(
+            call.message.chat.id,
+            "📥 Send the exported JSON database file to import."
+        )
+    elif data == "admin_users":
+        if call.from_user.id != ADMIN_ID:
+            bot.answer_callback_query(call.id, "Unauthorized")
+            return
+        conn  = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users")
+        total_users = cur.fetchone()[0]
+        cur.close()
+        release_connection(conn)
+        bot.edit_message_text(
+            f"👥 Total Users: {total_users}",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=admin_panel_markup()
+        )
+    elif data == "admin_analytics":
+
+        if call.from_user.id != ADMIN_ID:
+            bot.answer_callback_query(call.id, "Unauthorized")
+            return
+
+        conn = get_connection()
+        cur = conn.cursor()
+
+        # Total storage
+        cur.execute("SELECT COALESCE(SUM(file_size),0) FROM stored_media")
+        total_storage = cur.fetchone()[0]
+
+        # Storage by type
+        cur.execute("""
+            SELECT file_type, COALESCE(SUM(file_size),0)
+            FROM stored_media
+            GROUP BY file_type
+        """)
+        type_data = cur.fetchall()
+
+        # Top 5 users
+        cur.execute("""
+            SELECT user_id, COALESCE(SUM(file_size),0) as total
+            FROM stored_media
+            GROUP BY user_id
+            ORDER BY total DESC
+            LIMIT 5
+        """)
+        top_users = cur.fetchall()
+
+        # Last 7 days uploads
+        cur.execute("""
+            SELECT saved_at::date, COUNT(*)
+            FROM stored_media
+            WHERE saved_at >= CURRENT_DATE - INTERVAL '7 days'
+            GROUP BY saved_at::date
+            ORDER BY saved_at::date
+        """)
+        daily_uploads = cur.fetchall()
+
+        cur.close()
+        release_connection(conn)
+
+        # Format results
+        text = "📊 STORAGE ANALYTICS\n\n"
+
+        text += f"📦 Total Storage Used: {format_size(total_storage)}\n\n"
+
+        text += "📁 Storage by Type:\n"
+        for file_type, size in type_data:
+            text += f"• {file_type.capitalize()}: {format_size(size)}\n"
+
+        text += "\n👑 Top 5 Users:\n"
+        for user_id, size in top_users:
+            text += f"• {user_id} → {format_size(size)}\n"
+
+        text += "\n📅 Uploads Last 7 Days:\n"
+        for date, count in daily_uploads:
+            text += f"• {date} → {count} files\n"
+
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
+
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+    elif data == "admin_files":
+        if call.from_user.id != ADMIN_ID:
+            bot.answer_callback_query(call.id, "Unauthorized")
+            return
+        conn  = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM stored_media")
+        total_files = cur.fetchone()[0]
+        cur.close()
+        release_connection(conn)
+        bot.edit_message_text(
+            f"📦 Total Files: {total_files}",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=admin_panel_markup()
+        )
+    elif data.startswith("admin_userlist_"):
+        if call.from_user.id != ADMIN_ID:
+            bot.answer_callback_query(call.id, "Unauthorized")
+            return
+
+        page = int(data.split("_")[-1])
+        users = get_users_page(page)
+
+        text = f"👥 Select User (Page {page+1})"
+
+        markup = InlineKeyboardMarkup()
+
+        for user_id, username in users:
+
+            if username:
+                label = f"@{username}"
+            else:
+                label = f"User {user_id}"
+
+            markup.add(
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"admin_openuser_{user_id}"
+                )
+            )
+
+        if page > 0:
+            markup.add(
+                InlineKeyboardButton("⬅ Prev", callback_data=f"admin_userlist_{page-1}")
+            )
+
+        if len(users) == USERS_PER_PAGE:
+            markup.add(
+                InlineKeyboardButton("Next ➡", callback_data=f"admin_userlist_{page+1}")
+            )
+
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
+
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+    elif data.startswith("admin_openuser_"):
+        if call.from_user.id != ADMIN_ID:
+            return
+
+        user_id = int(data.split("_")[-1])
+
+        total = get_total_files(user_id)
+        cats = get_category_counts(user_id)
+        duplicates = get_user_duplicates(user_id)
+
+        text = (
+            f"👤 User ID: {user_id}\n\n"
+            f"📦 Total Files: {total}\n"
+            f"♻️ Duplicates: {duplicates}\n"
+            f"💾 Storage Used: {format_size(get_storage_used(user_id))}\n\n"
+            f"📷 Photos: {cats.get('photo',0)}\n"
+            f"🎥 Videos: {cats.get('video',0)}\n"
+            f"📄 Documents: {cats.get('document',0)}\n"
+            f"🎵 Audio: {cats.get('audio',0)}"
+        )
+
+        markup = InlineKeyboardMarkup()
+
+        markup.add(
+            InlineKeyboardButton(
+                "📂 View Files",
+                callback_data=f"admin_userfiles_{user_id}"
+            )
+        )
+        markup.add(
+            InlineKeyboardButton(
+                "📤 Send Media",
+                callback_data=f"admin_sendmedia_{user_id}"
+            )
+        )
+
+        markup.add(
+            InlineKeyboardButton(
+                "🔙 Back to users",
+                callback_data="admin_userlist_0"
+            )
+        )
+
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+    elif data.startswith("admin_userfiles_"):
+        if call.from_user.id != ADMIN_ID:
+            return
+
+        user_id = int(data.split("_")[-1])
+
+        text = "📂 Select category"
+
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=category_menu(user_id)
+        )
+    elif data.startswith("admin_sendmedia_"):
+        if call.from_user.id != ADMIN_ID:
+            return
+
+        user_id = int(data.split("_")[-1])
+
+        admin_send_state[call.from_user.id] = {
+            "target_user": user_id
+        }
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("🚀 Fast", callback_data="speed_fast"),
+            InlineKeyboardButton("⚖ Safe", callback_data="speed_safe"),
+        )
+        markup.add(
+            InlineKeyboardButton("🐢 Ultra Safe", callback_data="speed_ultra")
+        )
+
+        bot.send_message(
+            call.message.chat.id,
+            "⚙ Select sending speed:",
+            reply_markup=markup
+        )
+    elif data == "admin_cancel_send":
+
+        if call.from_user.id in admin_active_jobs:
+            admin_active_jobs[call.from_user.id]["cancel"] = True
+    elif data.startswith("speed_"):
+
+        if call.from_user.id not in admin_send_state:
+            return
+
+        speed_map = {
+            "speed_fast": 0.3,
+            "speed_safe": 1,
+            "speed_ultra": 2
+        }
+
+        selected_speed = speed_map.get(data, 1)
+
+        admin_send_state[call.from_user.id]["speed"] = selected_speed
+
+        target_user = admin_send_state[call.from_user.id]["target_user"]
+
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT group_id, group_title FROM user_send_groups
+            WHERE target_user = %s
+            ORDER BY id DESC
+            LIMIT 5
+        """, (target_user,))
+        groups = cur.fetchall()
+        cur.close()
+        release_connection(conn)
+
+        markup = InlineKeyboardMarkup()
+
+        # Add previous groups as buttons
+        for g_id, g_title in groups:
+
+            if validate_group(g_id):
+                markup.add(
+                    InlineKeyboardButton(
+                        f"📂 {g_title}",
+                        callback_data=f"use_group_{g_id}"
+                    )
+                )
+            else:
+                remove_group_from_db(g_id)
+        # Add manual entry option
+        markup.add(
+            InlineKeyboardButton("➕ Use New Group", callback_data="enter_new_group")
+        )
+
+        bot.send_message(
+            call.message.chat.id,
+            "📤 SELECT A GROUP OR ADD A NEW ONE:",
+            reply_markup=markup
+        )
+    elif data.startswith("use_group_"):
+
+        group_id = int(data.split("_")[-1])
+
+        if call.from_user.id not in admin_send_state:
+            bot.answer_callback_query(call.id, "Session expired")
+            return
+
+        admin_send_state[call.from_user.id]["group_id"] = group_id
+
+        # ✅ Fetch group title safely
+        try:
+            chat = bot.get_chat(group_id)
+            group_title = chat.title
+        except:
+            group_title = str(group_id)
+
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton(
+                "🚀 SEND ALL MEDIA NOW",
+                callback_data="admin_confirm_send"
+            )
+        )
+
+        bot.send_message(
+            call.message.chat.id,
+            f"✅ Group selected: `{group_title}`\n\nPress the button below to start sending.",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+
+    elif data == "enter_new_group":
+
+        bot.send_message(
+            call.message.chat.id,
+            "📩 Forward ANY message from target group\nOR send group ID."
+        )
+    elif data == "admin_confirm_send":
+        if call.from_user.id not in admin_send_state:
+            bot.answer_callback_query(call.id, "Session expired")
+            return
+
+        state = admin_send_state[call.from_user.id]
+
+        user_id = state["target_user"]
+        group_id = state.get("group_id")
+        speed = state.get("speed", 1)
+        # Get username safely
+        username = "Unknown"
+
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT username FROM users WHERE user_id = %s", (user_id,))
+        row = cur.fetchone()
+        if row and row[0]:
+            username = row[0]
+        cur.close()
+        release_connection(conn)
+        # fetch title safely
+        try:
+            chat = bot.get_chat(group_id)
+            group_title = chat.title
+        except:
+            group_title = str(group_id)
+
+        if not group_id:
+            bot.answer_callback_query(call.id, "Send group first")
+            return
+
+        bot.send_message(call.message.chat.id, "📥 Preparing media list...")
+        conn = get_connection()
+        cur = conn.cursor()
+
+        # Fetch media
+        # cur.execute("""
+        #     SELECT id, file_id, file_type, caption, media_group_id
+        #     FROM stored_media
+        #     WHERE user_id=%s
+        #     ORDER BY id ASC
+        # """, (user_id,))
+        # rows = cur.fetchall()
+
+        # Create job
+        cur.execute("""
+            INSERT INTO send_jobs (admin_id, target_user, group_id)
+            VALUES (%s,%s,%s)
+            RETURNING id
+        """, (call.from_user.id, user_id, group_id))
+
+        job_id = cur.fetchone()[0]
+        # Get total count only (lightweight)
+        cur.execute("""
+            SELECT COUNT(*) FROM stored_media
+            WHERE user_id = %s
+        """, (user_id,))
+        total_files = cur.fetchone()[0]
+        if total_files == 0:
+            bot.send_message(call.message.chat.id, "⚠ No media found.")
+            return
+        # Save group history
+        cur.execute("""
+            INSERT INTO user_send_groups (target_user, group_id, group_title)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (target_user, group_id)
+            DO UPDATE SET group_title = EXCLUDED.group_title
+        """, (user_id, group_id, group_title))
+
+        conn.commit()
+        cur.close()
+        release_connection(conn)
+        with job_status_lock:
+            job_status_cache[job_id] = "running"
+        job_queue.put({
+            "job_id": job_id,
+            "group_id": group_id,
+            "group_title": group_title,
+            "target_user": user_id,
+            "speed": speed,
+            "total": total_files,
+            "chat_id": call.message.chat.id
+        })
+        start_worker()
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("🔁 Change Group", callback_data=f"change_group_{job_id}")
+        )
+        markup.add(
+            InlineKeyboardButton("⏸ Pause", callback_data=f"pause_job_{job_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job_{job_id}")
+        )
+
+        bot.send_message(
+            call.message.chat.id,
+            f"🚀 Sending Started\n To Group: {group_title}\nTotal files: {total_files}",
+            reply_markup=markup
+        )
+
+        
+
+        admin_send_state.pop(call.from_user.id, None)
+    
+    elif data == "menu_files":
+        bot.edit_message_text(
+            "📂 Select Category",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=category_menu(call.from_user.id)
+        )
+    elif data.startswith("pause_job_"):
+
+        job_id = int(data.split("_")[-1])
+
+        with job_status_lock:
+            job_status_cache[job_id] = "paused"
+
+        job = live_jobs.get(job_id)
+        if not job:
+            return
+
+        sent = job["sent"]
+        total = job["total"]
+        group_title = job["group_title"]
+        chat_id = job["chat_id"]
+        message_id = job["message_id"]
+
+        percent = int((sent / total) * 100) if total else 0
+        bar = build_progress_bar(percent)
+
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("▶ Resume", callback_data=f"resume_job_{job_id}")
+        )
+        markup.add(
+            InlineKeyboardButton("🔁 Change Group", callback_data=f"change_group_{job_id}")
+        )
+        markup.add(
+            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job_{job_id}")
+        )
+
+        text = (
+            f"⏸ Sending to: {group_title} (Paused)\n\n"
+            f"[{bar}] {percent}%\n\n"
+            f"📊 {sent} / {total} files sent"
+        )
+
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
+    elif data.startswith("change_group_"):
+
+        job_id = int(data.split("_")[-1])
+
+        if job_id not in live_jobs:
+            bot.answer_callback_query(call.id, "Job not found")
+            return
+
+        admin_send_state[call.from_user.id] = {
+            "changing_job": job_id
+        }
+
+        bot.send_message(
+            call.message.chat.id,
+            "📩 Forward ANY message from new group\nOR send new group ID."
+        )
+    elif data.startswith("resume_job_"):
+
+        job_id = int(data.split("_")[-1])
+
+        with job_status_lock:
+            job_status_cache[job_id] = "running"
+
+        job = live_jobs.get(job_id)
+
+        if job:
+            sent = job["sent"]
+            total = job["total"]
+            group_title = job["group_title"]
+            chat_id = job["chat_id"]
+            message_id = job["message_id"]
+
+            percent = int((sent / total) * 100) if total else 0
+            bar = build_progress_bar(percent)
+
+            text = (
+                f"▶ Sending to: {group_title}\n\n"
+                f"[{bar}] {percent}%\n\n"
+                f"📊 {sent} / {total} files sent"
+            )
+            markup = InlineKeyboardMarkup()
+            markup.add(
+                InlineKeyboardButton("⏸ Pause", callback_data=f"pause_job_{job_id}")
+            )
+            markup.add(
+                InlineKeyboardButton("🔁 Change Group", callback_data=f"change_group_{job_id}")
+            )
+            markup.add(
+                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_job_{job_id}")
+            )
+
+            bot.edit_message_text(
+                text,
+                chat_id,
+                message_id,
+                reply_markup=markup
+            )
+
+            # bot.edit_message_text(text, chat_id, message_id)
+
+        bot.answer_callback_query(call.id, "Resumed")
+    
+    elif data.startswith("cat_"):
+        _, file_type, page = data.split("_")
+        page = int(page)
+        text, markup = category_page(call.from_user.id, file_type, page)
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+    elif data.startswith("cancel_job_"):
+
+        job_id = int(data.split("_")[-1])
+
+        # Stop worker loop
+        with job_status_lock:
+            job_status_cache[job_id] = "cancelled"
+
+        # Mark job inactive in DB
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE send_jobs
+            SET is_active = FALSE
+            WHERE id = %s
+        """, (job_id,))
+        conn.commit()
+        cur.close()
+        release_connection(conn)
+
+        job = live_jobs.get(job_id)
+
+        if job:
+            bot.edit_message_text(
+                "❌ Media sending cancelled.",
+                job["chat_id"],
+                job["message_id"]
+            )
+        live_jobs.pop(job_id, None)
+        bot.answer_callback_query(call.id, "Job cancelled")
+
+    elif data.startswith("get_"):
+        _, file_type, media_id = data.split("_")
+
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT file_id FROM stored_media WHERE id = %s AND user_id = %s",
+            (media_id, call.from_user.id)
+        )
+        result = cur.fetchone()
+        cur.close()
+        release_connection(conn)
+
+        if result:
+            file_id = result[0]
+
+            if file_type == "photo":
+                bot.send_photo(call.message.chat.id, file_id)
+            elif file_type == "video":
+                bot.send_video(call.message.chat.id, file_id)
+            elif file_type == "document":
+                bot.send_document(call.message.chat.id, file_id)
+            elif file_type == "audio":
+                bot.send_audio(call.message.chat.id, file_id)
+    
+# ================= ADMIN STATS ================= #
+
+@bot.message_handler(commands=['stats'])
+def stats(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM users")
+    total_users = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM stored_media")
+    total_files = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM stored_media WHERE saved_at::date = CURRENT_DATE")
+    today_uploads = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM users WHERE joined_at::date = CURRENT_DATE")
+    new_users_today = cur.fetchone()[0]
+
+    cur.close()
+    release_connection(conn)
+
+    bot.reply_to(
+        message,
+        f"📊 Bot Statistics\n\n"
+        f"👥 Total Users: {total_users}\n"
+        f"📦 Total Files: {total_files}\n"
+        f"📅 Uploads Today: {today_uploads}\n"
+        f"🆕 New Users Today: {new_users_today}"
+    )
+#-------------------ADMIN COMMAND TO EXPORT DB---------------------#
+import json
+import tempfile 
+@bot.message_handler(commands=['export_db'])
+def export_db(message):
+
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT user_id, file_id, file_type, caption, file_size, media_group_id, duplicate_count
+        FROM stored_media
+        ORDER BY id ASC
+    """)
+
+    rows = cur.fetchall()
+
+    cur.close()
+    release_connection(conn)
+
+    data = []
+
+    for r in rows:
+        data.append({
+            "user_id": r[0],
+            "file_id": r[1],
+            "file_type": r[2],
+            "caption": r[3],
+            "file_size": r[4],
+            "media_group_id": r[5],
+            "duplicate_count": r[6]
+        })
+
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+
+    with open(temp_file.name, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+    bot.send_document(message.chat.id, open(temp_file.name, "rb"))
+
+    bot.reply_to(message, f"✅ Export completed\nTotal media: {len(data)}")
+@bot.message_handler(commands=['import_db'])
+def import_db(message):
+
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    bot.reply_to(message, "📤 Send the exported JSON file to import.")
+def resume_jobs():
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, target_user, group_id, last_sent_id
+        FROM send_jobs
+        WHERE is_active = TRUE
+    """)
+    jobs = cur.fetchall()
+    cur.close()
+    release_connection(conn)
+
+    for job_id, target_user, group_id, last_sent_id in jobs:
+        try:
+            chat = bot.get_chat(group_id)
+            group_title = chat.title
+        except:
+            group_title = str(group_id)
+        # Get remaining file count only
+        conn = get_connection()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM stored_media
+            WHERE user_id = %s AND id > %s
+        """, (target_user, last_sent_id))
+
+        remaining = cur.fetchone()[0]
+
+        cur.close()
+        release_connection(conn)
+
+        if remaining == 0:
+            continue
+
+        with job_status_lock:
+            job_status_cache[job_id] = "running"
+
+        job_queue.put({
+            "job_id": job_id,
+            "group_id": group_id,
+            "group_title": group_title,
+            "target_user": target_user,
+            "speed": 1,
+            "total": remaining,
+            "chat_id": ADMIN_ID
+        })
+
+    if not job_queue.empty():
+        start_worker()
+def start_worker():
+    global worker_running
+
+    if worker_running:
+        return
+
+    worker_running = True
+    threading.Thread(target=queue_worker).start()
+def build_progress_bar(percent, length=20):
+    filled = int(length * percent / 100)
+    empty = length - filled
+    return "█" * filled + "░" * empty
+ 
+def queue_worker():
+    print("Worker started")
+    global worker_running
+    from collections import deque
+
+    send_timestamps = deque()
+    MAX_PER_MINUTE = 18
+    WINDOW_SECONDS = 60
+    last_send_time = 0
+    MIN_INTERVAL = 60 / 18  # 3.33 seconds
+    def enforce_rate_limit():
+        nonlocal last_send_time
+
+        now = time.time()
+        elapsed = now - last_send_time
+
+        if elapsed < MIN_INTERVAL:
+            sleep_time = MIN_INTERVAL - elapsed
+            time.sleep(sleep_time)
+
+        last_send_time = time.time()
+    while True:
+        try:
+            job = job_queue.get(timeout=1)
+        except:
+            continue
+
+        total = job["total"]
+        chat_id = job["chat_id"]
+        job_id = job["job_id"]
+        group_id = job["group_id"]
+        delay = job.get("speed", 2.5)
+
+        
+        progress_message = bot.send_message(chat_id, "📤 Sending started...")
+        live_jobs[job_id] = {
+            "sent": 0,
+            "total": total,
+            "group_id": job["group_id"],
+            "group_title": job["group_title"],
+            "message_id": progress_message.message_id,
+            "chat_id": chat_id,
+        }
+        sent = 0
+        start_time = time.time()
+        # ===== Adaptive Rate Control =====
+        rate_limit_hits = 0
+        base_delay = delay
+        extra_delay = 0
+        extra_pause_extension = 0
+        safe_break_interval = 600   # pause every 1000 files
+        # Group media
+        target_user = job["target_user"]
+        # Get resume position from DB
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT last_sent_id FROM send_jobs WHERE id = %s", (job_id,))
+        last_id = cur.fetchone()[0] or 0
+        cur.close()
+        release_connection(conn)
+        batch_size = 2000
+        empty_checks = 0
+        while True:
+
+            # Fetch next batch
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, file_id, file_type, caption, media_group_id
+                FROM stored_media
+                WHERE user_id = %s AND id > %s
+                ORDER BY id ASC
+                LIMIT %s
+            """, (target_user, last_id, batch_size))
+
+            rows = cur.fetchall()
+            cur.close()
+            release_connection(conn)
+
+            if not rows:
+
+                empty_checks += 1
+
+                if empty_checks >= 6:   # 6 × 5 seconds = 30 seconds idle
+                    break
+
+                time.sleep(5)
+                continue
+            else:
+                empty_checks = 0
+            grouped = {}
+
+            for media_id, file_id, file_type, caption, media_group_id in rows:
+                if media_group_id:
+                    grouped.setdefault(media_group_id, []).append(
+                        (media_id, file_id, file_type, caption)
+                    )
+                else:
+                    grouped[f"single_{media_id}"] = [
+                        (media_id, file_id, file_type, caption)
+                    ]
+
+            for group_key, items in grouped.items():
+                if job_status_cache.get(job_id) == "cancelled":
+                    # print("Job cancelled during sending:", job_id)
+                    break
+
+                while job_status_cache.get(job_id) == "paused":
+                    time.sleep(1)
+
+                if job_status_cache.get(job_id) == "cancelled":
+                    print("Job cancelled:", job_id)
+                    break
+
+                current_group_id = live_jobs[job_id]["group_id"]
+                if not validate_group(current_group_id):
+                    print("Group invalid. Removing:", current_group_id)
+
+                    remove_group_from_db(current_group_id)
+
+                    with job_status_lock:
+                        job_status_cache[job_id] = "cancelled"
+                    job_info = live_jobs.get(job_id, {})
+                    if job_info:
+                        try:
+                            bot.edit_message_text(
+                                "❌ Media Transfer Cancelled\n\n"
+                                "Reason: The bot was removed from the target group.\n\n"
+                                "Please add the bot back and start again.",
+                                job_info["chat_id"],
+                                job_info["message_id"]
+                            )
+                        except Exception as e:
+                            print(f"Error editing message: {e}")
+                    break
+                # Sending logic stays same as before
+                # (use your try/except block here)
+
+                # IMPORTANT:
+                try:    
+                    # =====================
+                    # ALBUM
+                    # =====================
+                    if len(items) > 1 and all(i[2] in ["photo", "video"] for i in items):
+
+                        media_list = []
+
+                        for index, (media_id, file_id, file_type, caption) in enumerate(items):
+
+                            if file_type == "photo":
+                                if index == 0:
+                                    media_list.append(InputMediaPhoto(file_id, caption=caption))
+                                else:
+                                    media_list.append(InputMediaPhoto(file_id))
+
+                            elif file_type == "video":
+                                if index == 0:
+                                    media_list.append(InputMediaVideo(file_id, caption=caption))
+                                else:
+                                    media_list.append(InputMediaVideo(file_id))
+                        for _ in media_list:    
+                            
+                            enforce_rate_limit()
+                        bot.send_media_group(current_group_id, media_list)
+
+                        sent += len(items)
+                        last_id = items[-1][0]  # ✅ correct last_id for album
+
+                        # 🔹 Update progress every 100
+                        if sent % 100 == 0:
+                            total = get_total_files(target_user)
+
+                            bot.send_message(
+                                current_group_id,
+                                f"📊 Progress Update\n\n"
+                                f"Sent: {sent}\n"
+                                f"Total So Far: {total}"
+                            )
+                    # =====================
+                    # SINGLE
+                    # =====================
+                    else:
+                        media_id, file_id, file_type, caption = items[0]
+
+                        if file_type == "photo":
+                            enforce_rate_limit()
+                            bot.send_photo(current_group_id, file_id, caption=caption)
+                        elif file_type == "video":
+                            enforce_rate_limit()
+                            bot.send_video(current_group_id, file_id, caption=caption)
+                        elif file_type == "document":
+                            enforce_rate_limit()    
+                            bot.send_document(current_group_id, file_id, caption=caption)
+                        elif file_type == "audio":
+                            enforce_rate_limit()
+                            bot.send_audio(current_group_id, file_id, caption=caption)
+
+                        sent += 1
+                        print("Sent count:", sent)
+                        last_id = media_id 
+
+                        # 🔹 Update progress every 100
+                        if sent % 100 == 0:
+                            total = get_total_files(target_user)
+
+                            bot.send_message(
+                                current_group_id,
+                                f"📊 Progress Update\n\n"
+                                f"Sent: {sent}\n"
+                                f"Total So Far: {total}"
+                            )# ✅ correct last_id for single
+
+                    live_jobs[job_id]["sent"] = sent
+                    rate_limit_hits = 0
+                    previous_sent = sent - len(items)
+
+                    if previous_sent // safe_break_interval < sent // safe_break_interval:
+
+                        pause_time = 360 + extra_pause_extension
+                        resume_timestamp = int(time.time() + pause_time)
+                        resume_clock = time.strftime("%H:%M:%S", time.localtime(resume_timestamp))
+
+                        percent = int((sent / total) * 100)
+
+                        try:
+                            bot.send_message(
+                                current_group_id,
+                                f"⏸ Smart Safety Pause Activated\n\n"
+                                f"📦 Total Media in Job: {total}\n"
+                                f"✅ Media Sent: {sent}\n"
+                                f"📊 Progress: {percent}%\n\n"
+                                f"⏳ Pause Duration: {pause_time//60} min\n"
+                                f"🕒 Resuming At: {resume_clock}\n\n"
+                                f"🚀 Sending will continue automatically."
+                            )
+                        except Exception as e:
+                            print("Pause message failed:", e)
+
+                        sleep_interval = 1
+                        slept = 0
+
+                        while slept < pause_time:
+                            if job_status_cache.get(job_id) == "cancelled":
+                                break
+                            time.sleep(sleep_interval)
+                            slept += sleep_interval
+                    # =====================
+                    # PROGRESS UPDATE
+                    # =====================
+                    if sent % 10 == 0 or sent == total:
+
+                        percent = int((sent / total) * 100)
+                        elapsed = time.time() - start_time
+
+                        if sent > 0:
+                            avg_time = elapsed / sent
+                            remaining = total - sent
+                            eta_seconds = int(avg_time * remaining)
+                            speed = round(sent / elapsed, 2)
+                        else:
+                            eta_seconds = 0
+                            speed = 0
+
+                        minutes = eta_seconds // 60
+                        seconds = eta_seconds % 60
+                        eta_text = f"{minutes}m {seconds}s" if eta_seconds > 0 else "calculating..."
+
+                        bar = build_progress_bar(percent)
+
+                        progress_text = (
+                            " Sending Media ⌯⌲\n\n"
+                            f"[{bar}] {percent}%\n\n"
+                            f"📊 {sent} / {total} files\n"
+                            f"⚡ Speed: {speed} files/sec\n"
+                            f"⏳ ETA: {eta_text}"
+                        )
+
+                        bot.edit_message_text(
+                            progress_text,
+                            chat_id,
+                            progress_message.message_id
+                        )
+
+                    # =====================
+                    # UPDATE RESUME POSITION
+                    # =====================
+                    # Update resume position every 50 files
+                    if sent % 50 == 0 or sent == total:
+                        conn = get_connection()
+                        cur = conn.cursor()
+                        cur.execute("""
+                            UPDATE send_jobs
+                            SET last_sent_id = %s
+                            WHERE id = %s
+                        """, (last_id, job_id))
+                        conn.commit()
+                        cur.close()
+                        release_connection(conn)
+                    # Gradual recovery if stable
+                    if rate_limit_hits == 0 and extra_delay > 0:
+                        extra_delay = max(0, extra_delay - 0.05)
+                        delay = base_delay + extra_delay
+                    time.sleep(delay)
+
+                except ApiTelegramException as e:
+                    if e.error_code == 429:
+
+                        retry_after = int(
+                            e.result_json.get("parameters", {}).get("retry_after", 5)
+                        )
+
+                        rate_limit_hits += 1
+
+                        # Increase delay dynamically
+                        extra_delay += 0.2
+                        delay = base_delay + extra_delay
+
+                        # Increase future pause duration
+                        extra_pause_extension += 120
+
+                        # IMPORTANT: DO NOT SEND ANY MESSAGE HERE
+                        # Respect Telegram first
+                        time.sleep(retry_after)
+
+                        # Optional: log only to console
+                        print(f"Rate limited. Slept {retry_after}s. New delay: {delay}")
+
+                        continue
+                    else:
+                        print("Telegram API error:", e)
+                        time.sleep(2)
+                        continue
+
+                except Exception as e:
+                    print("Unexpected error:", e)
+                    time.sleep(2)
+                    continue
+            if job_status_cache.get(job_id) == "cancelled":
+                break
+        # =========================
+        # JOB FINISHED
+        # =========================
+
+        if job_status_cache.get(job_id) != "cancelled":
+
+            completion_time = time.strftime("%H:%M:%S", time.localtime())
+            elapsed = int(time.time() - start_time)
+
+            hours = elapsed // 3600
+            minutes = (elapsed % 3600) // 60
+
+            bot.send_message(
+                current_group_id,
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ MEDIA TRANSFER COMPLETED\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📦 Total Media Sent: {sent}\n"
+                f"⏱ Duration: {hours}h {minutes}m\n"
+                f"🕒 Completed At: {completion_time}\n\n"
+                f"Transfer finished successfully."
+            )
+
+        # =========================
+        # MARK JOB COMPLETED IN DB
+        # =========================
+
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE send_jobs
+            SET is_active = FALSE
+            WHERE id = %s
+        """, (job_id,))
+        conn.commit()
+        cur.close()
+        release_connection(conn)
+
+        job_queue.task_done()
+        continue
+        
+        
+        # reuse your sender logic here
+# ================= START BOT ================= #
+import atexit
+
+@atexit.register
+def close_pool():
+    if db_pool:
+        db_pool.closeall()
+if __name__ == "__main__":
+    init_db()
+    resume_jobs()   # ADD THIS LINE
+    clean_invalid_groups()  # ADD THIS LINE
+    bot.remove_webhook()
+    
+    print("Bot is running...")
+    bot.infinity_polling(skip_pending=True)
