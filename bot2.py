@@ -481,8 +481,8 @@ def import_db_file(message):
             # insert media
             cur.execute("""
                 INSERT INTO stored_media
-                (user_id, file_id, file_type, caption, file_size, media_group_id, duplicate_count)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                (user_id,username, file_id, file_type, caption, file_size, media_group_id, duplicate_count)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (user_id, file_id) DO NOTHING
             """, (
                 item["user_id"],
@@ -1939,3 +1939,4 @@ if __name__ == "__main__":
     
     print("Bot is running...")
     bot.infinity_polling(skip_pending=True)
+
