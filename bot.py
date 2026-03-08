@@ -12,7 +12,7 @@ from psycopg2.pool import SimpleConnectionPool
 from telebot.apihelper import ApiTelegramException
 # ================= CONFIG ================= #
 
-BOT_TOKEN = "8507190616:AAF4RtM6S-rzTzGvcbVxo6QsxZVNBEXu6s0"
+BOT_TOKEN = "7858154079:AAFfAPLPt9cXk3ztcSx1XmrDCn-57zVy9wM"
 # DATABASE_URL = "YOUR_POSTGRES_URL"
 DATABASE_URL = os.getenv("DATABASE_URL")
 # ================= DATABASE POOL ================= #
@@ -470,10 +470,19 @@ def import_db_file(message):
     for item in data:
 
         try:
+
+            # ensure user exists
+            cur.execute("""
+                INSERT INTO users (user_id)
+                VALUES (%s)
+                ON CONFLICT (user_id) DO NOTHING
+            """, (item["user_id"],))
+
+            # insert media
             cur.execute("""
                 INSERT INTO stored_media
-                (user_id, file_id, file_type, caption, file_size, media_group_id, duplicate_count)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                (user_id, username,file_id, file_type, caption, file_size, media_group_id, duplicate_count)
+                VALUES (%s.%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (user_id, file_id) DO NOTHING
             """, (
                 item["user_id"],
@@ -482,13 +491,15 @@ def import_db_file(message):
                 item["caption"],
                 item["file_size"],
                 item["media_group_id"],
-                item["duplicate_count"]
+                item["duplicate_count"],
+                item["username"]
             ))
 
             inserted += 1
 
         except Exception as e:
             print("Import error:", e)
+            conn.rollback()   # reset failed transaction
 
     conn.commit()
     cur.close()
@@ -735,9 +746,11 @@ def callback_handler(call):
         cur = conn.cursor()
 
         cur.execute("""
-            SELECT user_id, file_id, file_type, caption, file_size, media_group_id, duplicate_count
-            FROM stored_media
-            ORDER BY id ASC
+            SELECT sm.user_id, u.username, sm.file_id, sm.file_type,
+                sm.caption, sm.file_size, sm.media_group_id, sm.duplicate_count
+            FROM stored_media sm
+            LEFT JOIN users u ON sm.user_id = u.user_id
+            ORDER BY sm.id ASC
         """)
 
         rows = cur.fetchall()
@@ -753,12 +766,13 @@ def callback_handler(call):
         for r in rows:
             data.append({
                 "user_id": r[0],
-                "file_id": r[1],
-                "file_type": r[2],
-                "caption": r[3],
-                "file_size": r[4],
-                "media_group_id": r[5],
-                "duplicate_count": r[6]
+                "username": r[1],
+                "file_id": r[2],
+                "file_type": r[3],
+                "caption": r[4],
+                "file_size": r[5],
+                "media_group_id": r[6],
+                "duplicate_count": r[7]
             })
 
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
@@ -768,7 +782,7 @@ def callback_handler(call):
 
         bot.send_document(call.message.chat.id, open(temp_file.name, "rb"))
 
-        bot.answer_callback_query(call.id, f"✅ Export completed.\nTotal media exported: {len(data)}")
+        bot.answer_callback_query(call.id, "Database exported successfully")
     elif data == "admin_import_db":
 
         if call.from_user.id != ADMIN_ID:
@@ -1928,5 +1942,4 @@ if __name__ == "__main__":
     bot.remove_webhook()
     
     print("Bot is running...")
-
     bot.infinity_polling(skip_pending=True)
