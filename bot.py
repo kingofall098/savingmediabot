@@ -25,6 +25,7 @@ db_pool = SimpleConnectionPool(
 ADMIN_ID = 8305774350  # Your Telegram ID
 user_sessions = {}
 user_timers = {}
+admin_migration_state = {}
 live_jobs = {}
 FILES_PER_PAGE = 5
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -317,6 +318,25 @@ def start(message):
         dashboard_text(message.from_user.id),
         reply_markup=dashboard_markup(message.from_user.id)
     )
+@bot.message_handler(func=lambda m: m.from_user.id == ADMIN_ID and m.from_user.id in admin_migration_state)
+def detect_migration_group(message):
+
+    global migration_group_id
+
+    if not message.forward_from_chat:
+        bot.reply_to(message, "❌ Please forward a message from the migration group.")
+        return
+
+    migration_group_id = message.forward_from_chat.id
+    group_title = message.forward_from_chat.title
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ Migration group saved\n\nGroup: {group_title}\nID: `{migration_group_id}`",
+        parse_mode="Markdown"
+    )
+
+    del admin_migration_state[message.from_user.id]
 @bot.message_handler(func=lambda m: m.from_user.id == ADMIN_ID and m.from_user.id in admin_send_state)
 def admin_group_input(message):
     
@@ -1219,6 +1239,7 @@ def callback_handler(call):
             call.message.chat.id,
             "📩 Forward ANY message from target group\nOR send group ID."
         )
+        admin_migration_state[ADMIN_ID] = True
     elif data == "admin_confirm_send":
         if call.from_user.id not in admin_send_state:
             bot.answer_callback_query(call.id, "Session expired")
@@ -1226,7 +1247,11 @@ def callback_handler(call):
 
         state = admin_send_state[call.from_user.id]
 
-        user_id = state["target_user"]
+        user_id = state.get("target_user")
+
+        if not user_id:
+            bot.answer_callback_query(call.id, "User session expired.")
+            return
         group_id = state.get("group_id")
         speed = state.get("speed", 1)
         # Get username safely
