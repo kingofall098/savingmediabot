@@ -1,3 +1,4 @@
+
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telebot.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
@@ -11,7 +12,7 @@ import random
 from psycopg2.pool import SimpleConnectionPool
 from telebot.apihelper import ApiTelegramException
 # ================= CONFIG ================= #
-
+migration_group_id = None
 BOT_TOKEN = "8648483733:AAG9Q5Ww3Tu0rGK3RzrBGqWvd3n2B6BAL20"
 # DATABASE_URL = "YOUR_POSTGRES_URL"
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -21,7 +22,7 @@ db_pool = SimpleConnectionPool(
     20,  # maximum connections
     dsn=DATABASE_URL
 )
-ADMIN_ID = 7816588091  # Your Telegram ID
+ADMIN_ID = 8305774350  # Your Telegram ID
 user_sessions = {}
 user_timers = {}
 live_jobs = {}
@@ -121,6 +122,10 @@ def admin_panel_markup():
     markup.add(InlineKeyboardButton("👤 View Users", callback_data="admin_userlist_0"))
     markup.add(InlineKeyboardButton("📤 Export Media DB", callback_data="admin_export_db"))
     markup.add(InlineKeyboardButton("📥 Import Media DB", callback_data="admin_import_db"))
+    markup.add(InlineKeyboardButton("🔄 Migrate Media To New Bot", callback_data="admin_migrate_media"))
+    markup.add(
+    InlineKeyboardButton("⚙ Set Migration Group", callback_data="set_migration_group")
+)
     markup.add(InlineKeyboardButton("📊 Storage Analytics", callback_data="admin_analytics"))
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="menu_main"))
     return markup
@@ -446,6 +451,41 @@ def reset_user_timer(user_id, chat_id):
 
     user_timers[user_id] = t
     t.start()
+@bot.message_handler(content_types=['photo','video','document','audio'])
+def capture_migration(message):
+
+    caption = message.caption
+
+    if message.content_type == "photo":
+        file_id = message.photo[-1].file_id
+        file_size = message.photo[-1].file_size
+        file_type = "photo"
+
+    elif message.content_type == "video":
+        file_id = message.video.file_id
+        file_size = message.video.file_size
+        file_type = "video"
+
+    elif message.content_type == "document":
+        file_id = message.document.file_id
+        file_size = message.document.file_size
+        file_type = "document"
+
+    elif message.content_type == "audio":
+        file_id = message.audio.file_id
+        file_size = message.audio.file_size
+        file_type = "audio"
+
+    save_user(message.from_user)
+
+    save_media(
+        message.from_user.id,
+        file_id,
+        file_type,
+        caption,
+        file_size,
+        message.media_group_id
+    )
 @bot.message_handler(content_types=['document'])
 def import_db_file(message):
 
@@ -742,6 +782,59 @@ def callback_handler(call):
             call.message.message_id,
             reply_markup=admin_panel_markup()
         )
+    elif data == "set_migration_group":
+
+        if call.from_user.id != ADMIN_ID:
+            return
+
+        bot.send_message(
+            call.message.chat.id,
+            "📩 Please forward any message from the migration group."
+        )
+
+        admin_send_state[call.from_user.id] = {"set_migration_group": True}
+    elif data == "admin_migrate_media":
+
+        if call.from_user.id != ADMIN_ID:
+            return
+
+        if not migration_group_id:
+            bot.send_message(call.message.chat.id, "❌ Migration group not set.")
+            return
+
+        MIGRATION_CHAT = migration_group_id # migration group id
+
+        conn = get_connection()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM stored_media
+        """)
+
+        total = cur.fetchone()[0]
+
+        cur.close()
+        release_connection(conn)
+
+        if total == 0:
+            bot.send_message(call.message.chat.id, "No media found.")
+            return
+
+        job_queue.put({
+            "job_id": f"migration_{int(time.time())}",
+            "group_id": MIGRATION_CHAT,
+            "group_title": "Migration Chat",
+            "target_user": None,
+            "speed": 0.5,
+            "total": total,
+            "chat_id": call.message.chat.id,
+            "migration": True
+        })
+
+        start_worker()
+
+        bot.send_message(call.message.chat.id, f"🚀 Migration started\nTotal media: {total}")
     elif data == "admin_export_db":
 
         if call.from_user.id != ADMIN_ID:
@@ -1539,6 +1632,29 @@ def resume_jobs():
 
     if not job_queue.empty():
         start_worker()
+@bot.message_handler(func=lambda m: m.from_user.id == ADMIN_ID and m.from_user.id in admin_send_state)
+def admin_group_detection(message):
+
+    global migration_group_id
+
+    state = admin_send_state.get(message.from_user.id)
+
+    if state and state.get("set_migration_group"):
+
+        if not message.forward_from_chat:
+            bot.reply_to(message, "❌ Please forward a message from the group.")
+            return
+
+        migration_group_id = message.forward_from_chat.id
+        group_title = message.forward_from_chat.title
+
+        bot.send_message(
+            message.chat.id,
+            f"✅ Migration group set successfully\n\nGroup: {group_title}\nID: `{migration_group_id}`",
+            parse_mode="Markdown"
+        )
+
+        del admin_send_state[message.from_user.id]
 def start_worker():
     global worker_running
 
@@ -1619,13 +1735,25 @@ def queue_worker():
             # Fetch next batch
             conn = get_connection()
             cur = conn.cursor()
-            cur.execute("""
-                SELECT id, file_id, file_type, caption, media_group_id
-                FROM stored_media
-                WHERE user_id = %s AND id > %s
-                ORDER BY id ASC
-                LIMIT %s
-            """, (target_user, last_id, batch_size))
+            if job.get("migration"):
+
+                cur.execute("""
+                    SELECT id, file_id, file_type, caption, media_group_id
+                    FROM stored_media
+                    WHERE id > %s
+                    ORDER BY id ASC
+                    LIMIT %s
+                """, (last_id, batch_size))
+
+            else:
+
+                cur.execute("""
+                    SELECT id, file_id, file_type, caption, media_group_id
+                    FROM stored_media
+                    WHERE user_id = %s AND id > %s
+                    ORDER BY id ASC
+                    LIMIT %s
+                """, (target_user, last_id, batch_size))
 
             rows = cur.fetchall()
             cur.close()
@@ -1949,5 +2077,3 @@ if __name__ == "__main__":
     
     print("Bot is running...")
     bot.infinity_polling(skip_pending=True)
-
-
